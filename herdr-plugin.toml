@@ -1,0 +1,35 @@
+id = "local.codex-auto-retry"
+name = "Codex Auto Retry"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Wait for Codex usage limits to reset, then resume the same session."
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["python3", "codex_auto_retry.py", "start"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "codex_auto_retry.py", "start"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "codex_auto_retry.py", "start"]
+
+[[actions]]
+id = "start"
+title = "Start Codex auto retry"
+contexts = ["global"]
+command = ["python3", "codex_auto_retry.py", "start"]
+
+[[actions]]
+id = "stop"
+title = "Stop Codex auto retry"
+contexts = ["global"]
+command = ["python3", "codex_auto_retry.py", "stop"]
+
+[[actions]]
+id = "status"
+title = "Codex auto retry status"
+contexts = ["global"]
+command = ["python3", "codex_auto_retry.py", "status"]
