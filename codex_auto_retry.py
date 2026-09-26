@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from typing import Any
 
 POLL_SECONDS = 12
 RESET_GRACE_SECONDS = 30
+MAX_OVERDUE_SECONDS = 24 * 60 * 60
 CONTINUE_PROMPT = (
     "Continue the interrupted task from the last safe point. "
     "Check what is already complete before repeating any work."
@@ -52,7 +54,7 @@ def pane_list() -> list[dict[str, Any]]:
 
 
 def pane_text(pane_id: str) -> str:
-    return herdr("pane", "read", pane_id, "--source", "recent", "--lines", "100", timeout=10)
+    return herdr("pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", "100", timeout=10)
 
 
 def session_key(pane: dict[str, Any]) -> str | None:
@@ -70,9 +72,10 @@ def parse_reset(text: str, now: dt.datetime | None = None) -> dt.datetime | None
     now = now or dt.datetime.now().astimezone()
     clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", " ", text)
     clean = re.sub(r"\s+", " ", clean)
-    limit = re.search(r"(?:you(?:'|’)ve hit|hit|reached|exceeded).{0,100}(?:usage|rate|session|weekly).{0,40}limit|(?:usage|rate|session|weekly) limit.{0,80}(?:hit|reached|try again)", clean, re.I)
-    if not limit:
+    limits = list(re.finditer(r"(?:you(?:'|’)ve hit|hit|reached|exceeded).{0,100}?(?:usage|rate|session|weekly).{0,40}?limit|(?:usage|rate|session|weekly) limit.{0,80}?(?:hit|reached|try again)", clean, re.I))
+    if not limits:
         return None
+    limit = limits[-1]
     nearby = clean[limit.start():limit.start() + 400]
 
     iso = re.search(r"\b20\d{2}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d)?", nearby)
@@ -103,12 +106,23 @@ def parse_reset(text: str, now: dt.datetime | None = None) -> dt.datetime | None
         for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p", "%b %d %I:%M %p", "%B %d %I:%M %p", "%I:%M %p"):
             candidate = re.sub(r"\s+(?!AM\b|PM\b)[A-Z]{2,5}$", "", raw.strip(), flags=re.I)
             try:
-                value = dt.datetime.strptime(candidate, fmt)
-                if "%Y" not in fmt:
+                parse_candidate, parse_fmt = candidate, fmt
+                if "%Y" not in fmt and ("%b" in fmt or "%B" in fmt):
+                    parse_candidate, parse_fmt = f"{candidate} 2000", f"{fmt} %Y"
+                value = dt.datetime.strptime(parse_candidate, parse_fmt)
+                if "%b" not in fmt and "%B" not in fmt:
+                    value = value.replace(year=now.year, month=now.month, day=now.day, tzinfo=now.tzinfo)
+                elif "%Y" not in fmt:
                     value = value.replace(year=now.year)
                     value = value.replace(tzinfo=now.tzinfo)
-                    if value < now - dt.timedelta(minutes=2):
-                        value = value.replace(year=value.year + 1) if "%b" in fmt or "%B" in fmt else value + dt.timedelta(days=1)
+                    # Choose the nearest year; an overdue reset must stay overdue.
+                    candidates = []
+                    for year in (now.year - 1, now.year, now.year + 1):
+                        try:
+                            candidates.append(value.replace(year=year))
+                        except ValueError:
+                            continue
+                    value = min(candidates, key=lambda candidate: abs((candidate - now).total_seconds()))
                 else:
                     value = value.replace(tzinfo=now.tzinfo)
                 return value
@@ -121,8 +135,10 @@ def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
 
 
 def start() -> int:
@@ -162,27 +178,68 @@ def worker_path(session_id: str) -> Path:
     return state_dir() / f"worker-{safe}.json"
 
 
-def launch_worker(pane: dict[str, Any], reset_at: dt.datetime) -> None:
+def launch_worker(pane: dict[str, Any], reset_at: dt.datetime) -> str:
     sid = session_key(pane)
     cwd = pane.get("cwd") or pane.get("foreground_cwd")
     if not sid or not cwd or not Path(cwd).is_dir():
-        return
+        return "missing session ID or valid working directory"
     record = worker_path(sid)
     if record.exists():
         try:
             previous = json.loads(record.read_text(encoding="utf-8"))
+            pid = previous.get("pid")
+            if not previous.get("finished") and pid and pid_alive(int(pid)):
+                return "worker already active"
             if previous.get("source_reset_at", previous.get("reset_at")) == reset_at.isoformat():
-                pid = previous.get("pid")
-                if pid and pid_alive(int(pid)):
-                    return
                 if previous.get("finished"):
-                    return
+                    return "reset already handled"
         except (ValueError, OSError, TypeError):
             pass
-    command = [sys.executable, str(Path(__file__).resolve()), "resume", sid, str(Path(cwd)), reset_at.isoformat()]
+    command = [sys.executable, str(Path(__file__).resolve()), "resume", sid, str(Path(cwd)), reset_at.isoformat(), str(pane.get("pane_id", ""))]
     proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
     record.write_text(json.dumps({"pid": proc.pid, "reset_at": reset_at.isoformat(), "source_reset_at": reset_at.isoformat(), "phase": "waiting", "started_at": dt.datetime.now().astimezone().isoformat()}), encoding="utf-8")
     log(f"scheduled Codex session {sid} for {reset_at.isoformat()}")
+    return "scheduled"
+
+
+def inspect_pane(pane: dict[str, Any], *, dry_run: bool = False, now: dt.datetime | None = None) -> str:
+    now = now or dt.datetime.now().astimezone()
+    status = pane.get("agent_status")
+    if status not in {"blocked", "idle", "done", "unknown"}:
+        return f"not waiting ({status})"
+    sid = session_key(pane)
+    if not sid:
+        return "missing session ID"
+    screen = pane_text(str(pane["pane_id"]))
+    digest = hashlib.sha256(re.sub(r"\s+", " ", screen).encode()).hexdigest()
+    record = worker_path(sid)
+    observation = record.with_name(record.name.replace("worker-", "observation-", 1))
+    reset_at = None
+    try:
+        cached = json.loads(observation.read_text(encoding="utf-8"))
+        if cached.get("digest") == digest:
+            reset_at = dt.datetime.fromisoformat(cached["reset_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if reset_at is None:
+        reset_at = parse_reset(screen, now)
+        if reset_at is not None and not dry_run:
+            observation.parent.mkdir(parents=True, exist_ok=True)
+            observation.write_text(json.dumps({"digest": digest, "reset_at": reset_at.isoformat()}), encoding="utf-8")
+    if reset_at is None:
+        return "no recognized usage-limit reset"
+    if (now - reset_at).total_seconds() > MAX_OVERDUE_SECONDS:
+        return "reset older than 24 hours; ignored"
+    if dry_run:
+        return f"eligible; reset {reset_at.isoformat()}"
+    return launch_worker(pane, reset_at)
+
+
+def diagnose() -> int:
+    for pane in pane_list():
+        if pane.get("agent") == "codex":
+            print(f"{pane['pane_id']}: {inspect_pane(pane, dry_run=True)}")
+    return 0
 
 
 def monitor() -> int:
@@ -191,17 +248,19 @@ def monitor() -> int:
     pidfile = directory / "monitor.pid"
     pidfile.write_text(str(os.getpid()), encoding="utf-8")
     log("monitor started")
+    decisions: dict[str, str] = {}
     try:
         while True:
             try:
                 for pane in pane_list():
-                    if pane.get("agent") != "codex" or pane.get("agent_status") != "blocked":
+                    if pane.get("agent") != "codex":
                         continue
                     try:
-                        screen = pane_text(str(pane["pane_id"]))
-                        reset_at = parse_reset(screen)
-                        if reset_at and reset_at > dt.datetime.now().astimezone():
-                            launch_worker(pane, reset_at)
+                        pane_id = str(pane["pane_id"])
+                        decision = inspect_pane(pane)
+                        if decisions.get(pane_id) != decision:
+                            log(f"Codex pane {pane_id}: {decision}")
+                            decisions[pane_id] = decision
                     except Exception as exc:
                         log(f"could not inspect Codex pane {pane.get('pane_id', '?')}: {type(exc).__name__}")
             except Exception as exc:
@@ -215,7 +274,7 @@ def monitor() -> int:
     return 0
 
 
-def resume_session(session_id: str, cwd: str, reset_iso: str) -> int:
+def resume_session(session_id: str, cwd: str, reset_iso: str, pane_id: str = "") -> int:
     reset_at = dt.datetime.fromisoformat(reset_iso)
     source_reset_iso = reset_iso
     state = worker_path(session_id)
@@ -227,7 +286,13 @@ def resume_session(session_id: str, cwd: str, reset_iso: str) -> int:
             state.write_text(json.dumps({"pid": os.getpid(), "reset_at": reset_at.isoformat(), "source_reset_at": source_reset_iso, "phase": "waiting"}), encoding="utf-8")
             time.sleep(wait_for)
             for attempt in range(7):
-                state.write_text(json.dumps({"pid": os.getpid(), "reset_at": reset_at.isoformat(), "phase": "resuming"}), encoding="utf-8")
+                if pane_id:
+                    pane = next((item for item in pane_list() if item.get("pane_id") == pane_id), None)
+                    if pane is None or session_key(pane) != session_id or pane.get("agent_status") == "working":
+                        log(f"Codex session {session_id}: automatic resume cancelled; pane closed, changed session, or already working")
+                        state.write_text(json.dumps({"reset_at": reset_iso, "source_reset_at": source_reset_iso, "finished": True}), encoding="utf-8")
+                        return 0
+                state.write_text(json.dumps({"pid": os.getpid(), "reset_at": reset_at.isoformat(), "source_reset_at": source_reset_iso, "phase": "resuming"}), encoding="utf-8")
                 result = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=None, check=False)
                 output = result.stdout + "\n" + result.stderr
                 next_reset = parse_reset(output)
@@ -260,7 +325,7 @@ def resume_session(session_id: str, cwd: str, reset_iso: str) -> int:
         return 1
     except Exception as exc:
         log(f"Codex resume for session {session_id} failed: {type(exc).__name__}")
-        state.write_text(json.dumps({"reset_at": reset_iso, "finished": True}), encoding="utf-8")
+        state.write_text(json.dumps({"reset_at": reset_iso, "source_reset_at": source_reset_iso, "finished": True}), encoding="utf-8")
         return 1
 
 
@@ -315,9 +380,11 @@ def main(argv: list[str]) -> int:
         return stop()
     if argv[0] == "status":
         return status()
-    if argv[0] == "resume" and len(argv) == 4:
-        return resume_session(argv[1], argv[2], argv[3])
-    print("Usage: codex_auto_retry.py [start|stop|status]")
+    if argv[0] == "diagnose":
+        return diagnose()
+    if argv[0] == "resume" and len(argv) in {4, 5}:
+        return resume_session(*argv[1:])
+    print("Usage: codex_auto_retry.py [start|stop|status|diagnose]")
     return 2
 
 

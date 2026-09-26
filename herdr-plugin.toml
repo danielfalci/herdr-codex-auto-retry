@@ -1,6 +1,6 @@
 id = "local.codex-auto-retry"
 name = "Codex Auto Retry"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.5"
 description = "Wait for Codex usage limits to reset, then resume the same session."
 platforms = ["linux", "macos"]
@@ -33,3 +33,9 @@ id = "status"
 title = "Codex auto retry status"
 contexts = ["global"]
 command = ["python3", "codex_auto_retry.py", "status"]
+
+[[actions]]
+id = "diagnose"
+title = "Diagnose Codex auto retry (read only)"
+contexts = ["global"]
+command = ["python3", "codex_auto_retry.py", "diagnose"]

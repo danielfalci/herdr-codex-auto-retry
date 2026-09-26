@@ -14,7 +14,7 @@ Linux and macOS are declared. Windows is not supported by this version.
 
 ## Install
 
-For a local checkout:
+For a local checkout (development changes are used directly by Herdr):
 
 ```sh
 herdr plugin link .
@@ -34,10 +34,13 @@ herdr plugin install <owner>/herdr-codex-auto-retry
 - `local.codex-auto-retry.start` starts the background monitor.
 - `local.codex-auto-retry.status` shows monitor state and recent events.
 - `local.codex-auto-retry.stop` stops the monitor and pending waits.
+- `local.codex-auto-retry.diagnose` reads current Codex panes and reports eligibility without resuming anything.
 
-The monitor checks blocked Codex panes every 12 seconds. It only schedules a resume when the pane contains a recognized usage-limit message and a parseable reset time. It resumes the same session ID and working directory and stops after eight consecutive quota windows as a runaway guard.
+The monitor checks waiting Codex panes (`idle`, `done`, `blocked`, or `unknown`) every 12 seconds. Herdr uses `blocked` for approval/question dialogs; a quota error can leave Codex `idle`. It reads unwrapped terminal text and only schedules a resume for an explicit usage-limit notice with a parseable reset time. Resets that passed within the last 24 hours are eligible; older notices are ignored. A time-only reset uses today, and an observed reset is cached using a screen hash so polling does not move relative deadlines.
 
-Logs and per-session retry state are kept in Herdr's plugin state directory. The plugin does not save pane transcripts or Codex output.
+It resumes the same session ID and working directory and stops after eight consecutive quota windows as a runaway guard. Only one live worker is allowed per session. Before running, the worker cancels if the originating pane closed, switched sessions, or is already working. Retrying runs in a background `codex exec resume` process; its output does not appear in the original interactive pane. Normal permissions apply, and interactive approvals can require manual intervention.
+
+Logs and per-session retry state are kept in Herdr's plugin state directory. The plugin does not save pane transcripts or Codex output. Logs record scheduling and inspection decisions only when they change. Observation files contain only a screen hash and the parsed reset timestamp.
 
 ## Development
 
@@ -48,3 +51,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests use synthetic terminal messages and mocked Codex subprocesses; they do not spend quota or resume a live session.
+
+## 0.2.0 validation
+
+Regression tests cover idle quota errors, overdue resets, time-only dates, latest notices, unwrapped reads, relative deadline stability, duplicate workers, read-only diagnosis, and cancellation when a session is already working. Tests mock Codex and do not consume quota. A real quota-reset cycle still needs validation under normal use.
