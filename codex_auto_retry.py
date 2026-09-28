@@ -19,9 +19,18 @@ from typing import Any
 POLL_SECONDS = 12
 RESET_GRACE_SECONDS = 30
 MAX_OVERDUE_SECONDS = 24 * 60 * 60
+MAX_CHAIN_HOPS = 8
+STALE_TRAILING_CHARS = 300
+MAX_SEND_ATTEMPTS = 5
+CONFIRM_TIMEOUT_MS = 20000
 CONTINUE_PROMPT = (
     "Continue the interrupted task from the last safe point. "
     "Check what is already complete before repeating any work."
+)
+ACTIVE_WORKER_PHASES = {"waiting", "sending"}
+APPROVAL_DIALOG_PATTERN = re.compile(
+    r"\ballow\b[^\n?]{0,80}\?|\bapprove\b|\[y/n\]|\d\.\s*yes\b.{0,60}\d\.\s*no\b",
+    re.I | re.S,
 )
 
 
@@ -57,10 +66,104 @@ def pane_text(pane_id: str) -> str:
     return herdr("pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", "100", timeout=10)
 
 
+def pane_lookup(pane_id: str) -> dict[str, Any] | None:
+    for pane in pane_list():
+        if str(pane.get("pane_id")) == pane_id:
+            return pane
+    return None
+
+
 def session_key(pane: dict[str, Any]) -> str | None:
     session = pane.get("agent_session") or {}
     value = session.get("value")
     return str(value) if value else None
+
+
+def is_approval_dialog(screen: str) -> bool:
+    """Heuristic: an approval/question prompt, not a plain quota notice.
+
+    Best-effort pattern match; not verified against a live Codex TUI screen.
+    Refine after real-session validation (see diagnostic doc).
+    """
+    clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", " ", screen)
+    return bool(APPROVAL_DIALOG_PATTERN.search(clean))
+
+
+def ready_to_send(pane_id: str, session_id: str) -> tuple[bool, str]:
+    pane = pane_lookup(pane_id)
+    if pane is None:
+        return False, "pane closed"
+    if session_key(pane) != session_id:
+        return False, "pane now shows a different session"
+    if pane.get("agent_status") == "working":
+        return False, "pane already working"
+    if is_approval_dialog(pane_text(pane_id)):
+        return False, "pane is waiting on an approval or question"
+    return True, "ready"
+
+
+def _agent_prompt_call(pane_id: str, text: str, *, timeout_ms: int) -> dict[str, Any]:
+    """Run `herdr agent prompt` directly (not through `herdr()`) so a
+    rejection or timeout's error payload can be inspected instead of just
+    raising on a non-zero exit code.
+    """
+    binary = os.environ.get("HERDR_BIN_PATH", "herdr")
+    result = subprocess.run(
+        [binary, "agent", "prompt", pane_id, text, "--wait", "--until", "working", "--until", "blocked", "--timeout", str(timeout_ms)],
+        capture_output=True,
+        text=True,
+        timeout=(timeout_ms / 1000) + 15,
+        check=False,
+    )
+    try:
+        return json.loads(result.stdout or result.stderr or "{}")
+    except ValueError:
+        return {}
+
+
+def send_and_confirm(
+    pane_id: str,
+    session_id: str,
+    prompt: str,
+    *,
+    timeout_ms: int = CONFIRM_TIMEOUT_MS,
+) -> tuple[str, dt.datetime | None]:
+    """Submit the continuation through `herdr agent prompt`.
+
+    That command sends text and Enter as one ordered, bracketed-paste-aware
+    submission and waits for the pane to settle into `working` or `blocked`
+    (or times out) — this replaces an earlier version that sent raw
+    `pane send-text` + `send-keys enter`, which did not reliably submit in
+    the Codex TUI and left the prompt sitting unsent in the input box on
+    every retry.
+
+    Returns (outcome, next_reset): "resumed" (work started), "cancelled"
+    (pane closed or switched session), "needs_intervention" (herdr itself
+    rejected the submission because the pane is blocked on an approval or
+    question), "new_limit" (another usage-limit notice appeared, with its
+    parsed reset time), or "unconfirmed" (submitted but no change observed
+    before the timeout).
+    """
+    payload = _agent_prompt_call(pane_id, prompt, timeout_ms=timeout_ms)
+    error_code = (payload.get("error") or {}).get("code")
+    if error_code == "agent_not_found":
+        return "cancelled", None
+    if error_code == "agent_blocked":
+        return "needs_intervention", None
+
+    pane = pane_lookup(pane_id)
+    if pane is None or session_key(pane) != session_id:
+        return "cancelled", None
+    status = pane.get("agent_status")
+    if status == "working":
+        return "resumed", None
+    if status == "blocked":
+        return "needs_intervention", None
+    screen = pane_text(pane_id)
+    next_reset = parse_reset(screen)
+    if next_reset is not None and next_reset > dt.datetime.now().astimezone():
+        return "new_limit", next_reset
+    return "unconfirmed", None
 
 
 def localize(value: dt.datetime) -> dt.datetime:
@@ -77,6 +180,11 @@ def parse_reset(text: str, now: dt.datetime | None = None) -> dt.datetime | None
         return None
     limit = limits[-1]
     nearby = clean[limit.start():limit.start() + 400]
+    trailing = clean[limit.start() + 400:]
+    if len(trailing.strip()) > STALE_TRAILING_CHARS:
+        # Something substantial happened on screen after this notice: the
+        # session has moved on, so treat it as history, not a live block.
+        return None
 
     iso = re.search(r"\b20\d{2}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d)?", nearby)
     if iso:
@@ -181,24 +289,43 @@ def worker_path(session_id: str) -> Path:
 def launch_worker(pane: dict[str, Any], reset_at: dt.datetime) -> str:
     sid = session_key(pane)
     cwd = pane.get("cwd") or pane.get("foreground_cwd")
+    pane_id = str(pane.get("pane_id") or "")
     if not sid or not cwd or not Path(cwd).is_dir():
         return "missing session ID or valid working directory"
+    if not pane_id:
+        return "missing pane ID"
+    reset_iso = reset_at.isoformat()
     record = worker_path(sid)
     if record.exists():
         try:
             previous = json.loads(record.read_text(encoding="utf-8"))
-            pid = previous.get("pid")
-            if not previous.get("finished") and pid and pid_alive(int(pid)):
-                return "worker already active"
-            if previous.get("source_reset_at", previous.get("reset_at")) == reset_at.isoformat():
-                if previous.get("finished"):
-                    return "reset already handled"
         except (ValueError, OSError, TypeError):
-            pass
-    command = [sys.executable, str(Path(__file__).resolve()), "resume", sid, str(Path(cwd)), reset_at.isoformat(), str(pane.get("pane_id", ""))]
+            previous = None
+        if previous is not None:
+            if "phase" not in previous:
+                # Pre-0.3.0 state file (used "finished" instead of "phase").
+                # Its outcome is unknown under the current schema, so do not
+                # infer eligibility from it; require a human to clear it.
+                return "legacy worker state; clear it manually before retrying"
+            pid = previous.get("pid")
+            if previous.get("phase") in ACTIVE_WORKER_PHASES and pid and pid_alive(int(pid)):
+                return "worker already active"
+            if previous.get("last_reset_handled") == reset_iso:
+                return "reset already handled"
+            if previous.get("phase") == "needs_intervention" and previous.get("source_reset_at") == reset_iso:
+                return "needs manual intervention"
+    command = [sys.executable, str(Path(__file__).resolve()), "resume", sid, str(Path(cwd)), reset_iso, pane_id]
     proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
-    record.write_text(json.dumps({"pid": proc.pid, "reset_at": reset_at.isoformat(), "source_reset_at": reset_at.isoformat(), "phase": "waiting", "started_at": dt.datetime.now().astimezone().isoformat()}), encoding="utf-8")
-    log(f"scheduled Codex session {sid} for {reset_at.isoformat()}")
+    record.write_text(json.dumps({
+        "pid": proc.pid,
+        "session_id": sid,
+        "pane_id": pane_id,
+        "reset_at": reset_iso,
+        "source_reset_at": reset_iso,
+        "phase": "waiting",
+        "started_at": dt.datetime.now().astimezone().isoformat(),
+    }), encoding="utf-8")
+    log(f"scheduled Codex session {sid} for {reset_iso}")
     return "scheduled"
 
 
@@ -275,57 +402,98 @@ def monitor() -> int:
 
 
 def resume_session(session_id: str, cwd: str, reset_iso: str, pane_id: str = "") -> int:
+    """Wait for the reset, then continue the session through its own pane.
+
+    This sends the continuation prompt into the original interactive pane
+    (via `herdr pane send-text` / `send-keys`) instead of spawning a second
+    `codex exec resume` writer against the same session, which is what
+    caused the persistent lock conflict this fix addresses. A pane is
+    required: if the originating pane is unknown, the worker cancels rather
+    than falling back to a headless resume of a session nobody supervises.
+    """
     reset_at = dt.datetime.fromisoformat(reset_iso)
     source_reset_iso = reset_iso
     state = worker_path(session_id)
+
+    def write(phase: str, **extra: Any) -> None:
+        payload: dict[str, Any] = {
+            "pid": os.getpid(),
+            "session_id": session_id,
+            "pane_id": pane_id,
+            "source_reset_at": source_reset_iso,
+            "reset_at": reset_at.isoformat(),
+            "phase": phase,
+            "updated_at": dt.datetime.now().astimezone().isoformat(),
+        }
+        payload.update(extra)
+        state.write_text(json.dumps(payload), encoding="utf-8")
+
+    if not pane_id:
+        log(f"Codex session {session_id}: no pane to resume through; automatic resume skipped")
+        write("cancelled", reason="no pane_id")
+        return 1
+
     try:
-        cmd = ["codex", "exec", "resume", "--all", session_id, CONTINUE_PROMPT]
-        for cycle in range(8):
+        for _hop in range(MAX_CHAIN_HOPS):
             wait_for = max(0, (reset_at - dt.datetime.now().astimezone()).total_seconds()) + RESET_GRACE_SECONDS
             log(f"waiting {int(wait_for)}s before resuming session {session_id}")
-            state.write_text(json.dumps({"pid": os.getpid(), "reset_at": reset_at.isoformat(), "source_reset_at": source_reset_iso, "phase": "waiting"}), encoding="utf-8")
+            write("waiting")
             time.sleep(wait_for)
-            for attempt in range(7):
-                if pane_id:
-                    pane = next((item for item in pane_list() if item.get("pane_id") == pane_id), None)
-                    if pane is None or session_key(pane) != session_id or pane.get("agent_status") == "working":
-                        log(f"Codex session {session_id}: automatic resume cancelled; pane closed, changed session, or already working")
-                        state.write_text(json.dumps({"reset_at": reset_iso, "source_reset_at": source_reset_iso, "finished": True}), encoding="utf-8")
+
+            advance_hop = False
+            for attempt in range(MAX_SEND_ATTEMPTS):
+                ready, reason = ready_to_send(pane_id, session_id)
+                if not ready:
+                    if reason in {"pane closed", "pane now shows a different session", "pane already working"}:
+                        log(f"Codex session {session_id}: automatic resume cancelled; {reason}")
+                        write("cancelled", reason=reason)
                         return 0
-                state.write_text(json.dumps({"pid": os.getpid(), "reset_at": reset_at.isoformat(), "source_reset_at": source_reset_iso, "phase": "resuming"}), encoding="utf-8")
-                result = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=None, check=False)
-                output = result.stdout + "\n" + result.stderr
-                next_reset = parse_reset(output)
-                if next_reset and next_reset > dt.datetime.now().astimezone() + dt.timedelta(seconds=RESET_GRACE_SECONDS):
-                    reset_at = next_reset
-                    reset_iso = reset_at.isoformat()
-                    log(f"Codex session {session_id} reached another usage limit; scheduled its next reset")
-                    state.write_text(json.dumps({"pid": os.getpid(), "reset_at": reset_iso, "source_reset_at": source_reset_iso, "phase": "waiting"}), encoding="utf-8")
-                    break
-                if result.returncode == 0:
-                    log(f"Codex session {session_id} resumed and finished (exit 0)")
-                    state.write_text(json.dumps({"reset_at": reset_iso, "source_reset_at": source_reset_iso, "finished": True}), encoding="utf-8")
+                    log(f"Codex session {session_id}: {reason}; needs manual intervention")
+                    write("needs_intervention", reason=reason)
+                    return 1
+
+                write("sending")
+                outcome, next_reset = send_and_confirm(pane_id, session_id, CONTINUE_PROMPT)
+
+                if outcome == "resumed":
+                    log(f"Codex session {session_id} resumed via pane {pane_id}")
+                    write("resumed", last_reset_handled=reset_at.isoformat())
                     return 0
-                lower = output.lower()
-                if not any(marker in lower for marker in ("already in use", "active writer", "locked by another", "thread is currently active")):
-                    log(f"Codex resume for session {session_id} exited {result.returncode}; inspect Codex output")
-                    state.write_text(json.dumps({"reset_at": reset_iso, "source_reset_at": source_reset_iso, "finished": True}), encoding="utf-8")
-                    return result.returncode
-                if attempt < 6:
+                if outcome == "cancelled":
+                    log(f"Codex session {session_id}: automatic resume cancelled; pane closed or changed session after send")
+                    write("cancelled", reason="pane closed or changed session after send")
+                    return 0
+                if outcome == "new_limit" and next_reset is not None:
+                    reset_at = next_reset
+                    log(f"Codex session {session_id} reached another usage limit; scheduled its next reset")
+                    write("waiting")
+                    advance_hop = True
+                    break
+                if outcome == "needs_intervention":
+                    log(f"Codex session {session_id}: herdr rejected the submission; pane is blocked on an approval or question")
+                    write("needs_intervention", reason="pane blocked on an approval or question during send")
+                    return 1
+
+                # unconfirmed: no visible change after sending
+                if attempt < MAX_SEND_ATTEMPTS - 1:
                     delay = min(60, 5 * (2 ** attempt))
-                    log(f"Codex session {session_id} is still open in another writer; retrying in {delay}s")
-                    state.write_text(json.dumps({"pid": os.getpid(), "reset_at": reset_at.isoformat(), "source_reset_at": source_reset_iso, "phase": "waiting"}), encoding="utf-8")
+                    log(f"Codex session {session_id}: resume unconfirmed; retrying in {delay}s")
+                    write("waiting")
                     time.sleep(delay)
-            else:
-                log(f"Codex session {session_id} stayed open in another writer; automatic resume stopped")
-                state.write_text(json.dumps({"reset_at": reset_iso, "source_reset_at": source_reset_iso, "finished": True}), encoding="utf-8")
+                    continue
+                log(f"Codex session {session_id}: could not confirm the resume after {MAX_SEND_ATTEMPTS} attempts")
+                write("needs_intervention", reason="could not confirm resume")
                 return 1
+
+            if advance_hop:
+                continue
+
         log(f"Codex session {session_id} reached the automatic retry cap")
-        state.write_text(json.dumps({"reset_at": reset_iso, "source_reset_at": source_reset_iso, "finished": True}), encoding="utf-8")
+        write("needs_intervention", reason="reached chain-hop cap")
         return 1
     except Exception as exc:
         log(f"Codex resume for session {session_id} failed: {type(exc).__name__}")
-        state.write_text(json.dumps({"reset_at": reset_iso, "source_reset_at": source_reset_iso, "finished": True}), encoding="utf-8")
+        write("needs_intervention", reason=f"unexpected error: {type(exc).__name__}")
         return 1
 
 
@@ -342,7 +510,7 @@ def stop() -> int:
             try:
                 item = json.loads(worker.read_text(encoding="utf-8"))
                 worker_pid = int(item.get("pid", 0))
-                if item.get("phase") == "waiting" and worker_pid and pid_alive(worker_pid):
+                if item.get("phase") in ACTIVE_WORKER_PHASES and worker_pid and pid_alive(worker_pid):
                     os.killpg(worker_pid, signal.SIGTERM)
                     stopped += 1
             except (ValueError, OSError, TypeError, json.JSONDecodeError):
