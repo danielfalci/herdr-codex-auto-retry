@@ -23,6 +23,9 @@ MAX_CHAIN_HOPS = 8
 STALE_TRAILING_CHARS = 300
 MAX_SEND_ATTEMPTS = 5
 CONFIRM_TIMEOUT_MS = 20000
+POST_START_CHECKS = 20
+POST_START_POLL_SECONDS = 0.5
+EXPIRED_RESET_BACKOFF_SECONDS = 120
 CONTINUE_PROMPT = (
     "Continue the interrupted task from the last safe point. "
     "Check what is already complete before repeating any work."
@@ -73,10 +76,38 @@ def pane_lookup(pane_id: str) -> dict[str, Any] | None:
     return None
 
 
+def process_key(pane: dict[str, Any], proc_root: Path = Path("/proc")) -> str | None:
+    """Linux fallback: bind retries to one Codex process in this terminal.
+
+    Never infer identity from cwd (multiple sessions can share it). PID and
+    kernel start time prevent a restarted process from inheriting a retry.
+    """
+    if pane.get("agent") != "codex" or not pane.get("terminal_id") or not pane.get("pane_id"):
+        return None
+    matches = []
+    for proc in proc_root.glob("[0-9]*"):
+        try:
+            if (proc / "comm").read_text().strip() != "codex":
+                continue
+            env = (proc / "environ").read_bytes().split(b"\0")
+            expected = f"HERDR_PANE_ID={pane['pane_id']}".encode()
+            if expected not in env:
+                continue
+            # Exclude app-server and exec children inheriting the same pane.
+            args = (proc / "cmdline").read_bytes().split(b"\0")[1:]
+            if any(arg in {b"app-server", b"exec", b"mcp-server"} for arg in args):
+                continue
+            fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+            matches.append(f"process-{pane['terminal_id']}-{proc.name}-{fields[19]}")
+        except (OSError, ValueError, IndexError):
+            continue
+    return matches[0] if len(matches) == 1 else None
+
+
 def session_key(pane: dict[str, Any]) -> str | None:
     session = pane.get("agent_session") or {}
     value = session.get("value")
-    return str(value) if value else None
+    return str(value) if value else process_key(pane)
 
 
 def is_approval_dialog(screen: str) -> bool:
@@ -97,7 +128,10 @@ def ready_to_send(pane_id: str, session_id: str) -> tuple[bool, str]:
         return False, "pane now shows a different session"
     if pane.get("agent_status") == "working":
         return False, "pane already working"
-    if is_approval_dialog(pane_text(pane_id)):
+    screen = pane_text(pane_id)
+    if session_id.startswith("process-") and parse_reset(screen) is None:
+        return False, "quota notice no longer present"
+    if is_approval_dialog(screen):
         return False, "pane is waiting on an approval or question"
     return True, "ready"
 
@@ -155,13 +189,24 @@ def send_and_confirm(
     if pane is None or session_key(pane) != session_id:
         return "cancelled", None
     status = pane.get("agent_status")
+    # `working` may only be the request starting; a quota rejection can
+    # return the TUI to idle immediately. Observe that transition before
+    # recording this reset as handled.
+    for _ in range(POST_START_CHECKS):
+        if status != "working":
+            break
+        time.sleep(POST_START_POLL_SECONDS)
+        pane = pane_lookup(pane_id)
+        if pane is None or session_key(pane) != session_id:
+            return "cancelled", None
+        status = pane.get("agent_status")
     if status == "working":
         return "resumed", None
     if status == "blocked":
         return "needs_intervention", None
     screen = pane_text(pane_id)
     next_reset = parse_reset(screen)
-    if next_reset is not None and next_reset > dt.datetime.now().astimezone():
+    if next_reset is not None:
         return "new_limit", next_reset
     return "unconfirmed", None
 
@@ -413,6 +458,7 @@ def resume_session(session_id: str, cwd: str, reset_iso: str, pane_id: str = "")
     """
     reset_at = dt.datetime.fromisoformat(reset_iso)
     source_reset_iso = reset_iso
+    last_quota_reset_iso = reset_iso
     state = worker_path(session_id)
 
     def write(phase: str, **extra: Any) -> None:
@@ -444,7 +490,7 @@ def resume_session(session_id: str, cwd: str, reset_iso: str, pane_id: str = "")
             for attempt in range(MAX_SEND_ATTEMPTS):
                 ready, reason = ready_to_send(pane_id, session_id)
                 if not ready:
-                    if reason in {"pane closed", "pane now shows a different session", "pane already working"}:
+                    if reason in {"pane closed", "pane now shows a different session", "pane already working", "quota notice no longer present"}:
                         log(f"Codex session {session_id}: automatic resume cancelled; {reason}")
                         write("cancelled", reason=reason)
                         return 0
@@ -457,14 +503,24 @@ def resume_session(session_id: str, cwd: str, reset_iso: str, pane_id: str = "")
 
                 if outcome == "resumed":
                     log(f"Codex session {session_id} resumed via pane {pane_id}")
-                    write("resumed", last_reset_handled=reset_at.isoformat())
+                    write("resumed", last_reset_handled=last_quota_reset_iso)
                     return 0
                 if outcome == "cancelled":
                     log(f"Codex session {session_id}: automatic resume cancelled; pane closed or changed session after send")
                     write("cancelled", reason="pane closed or changed session after send")
                     return 0
                 if outcome == "new_limit" and next_reset is not None:
-                    reset_at = next_reset
+                    last_quota_reset_iso = next_reset.isoformat()
+                    now = dt.datetime.now().astimezone()
+                    if next_reset <= now:
+                        # Displayed minute can stay unchanged after its reset.
+                        # Retry with bounded backoff instead of marking success
+                        # or sending repeatedly at the expired timestamp.
+                        backoff = min(600, EXPIRED_RESET_BACKOFF_SECONDS * (2 ** _hop))
+                        reset_at = now + dt.timedelta(seconds=backoff)
+                        log(f"Codex session {session_id}: quota still unavailable after displayed reset; backing off {backoff}s")
+                    else:
+                        reset_at = next_reset
                     log(f"Codex session {session_id} reached another usage limit; scheduled its next reset")
                     write("waiting")
                     advance_hop = True

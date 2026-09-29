@@ -102,7 +102,7 @@ class ReadyToSendTests(unittest.TestCase):
 class SendAndConfirmTests(unittest.TestCase):
     def test_resumed_when_status_becomes_working_after_submission(self):
         working_pane = {"pane_id": "w1:p1", "agent_status": "working", "agent_session": {"value": "session-123"}}
-        with mock.patch.object(plugin, "_agent_prompt_call", return_value={"result": {}}) as call, mock.patch.object(plugin, "pane_lookup", return_value=working_pane):
+        with mock.patch.object(plugin, "_agent_prompt_call", return_value={"result": {}}) as call, mock.patch.object(plugin, "pane_lookup", return_value=working_pane), mock.patch.object(plugin.time, "sleep"):
             outcome, next_reset = plugin.send_and_confirm("w1:p1", "session-123", "continue")
         self.assertEqual(outcome, "resumed")
         self.assertIsNone(next_reset)

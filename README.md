@@ -46,6 +46,10 @@ Each worker records an explicit outcome instead of a single ambiguous "finished"
 
 Logs and per-session retry state are kept in Herdr's plugin state directory. The plugin does not save pane transcripts or Codex output. Logs record scheduling and inspection decisions only when they change. Observation files contain only a screen hash and the parsed reset timestamp.
 
+## Missing Herdr session metadata
+
+On Linux, when `agent_session` is absent, the plugin identifies the unique interactive Codex process with the matching `HERDR_PANE_ID`. The retry key includes the terminal ID, PID, and kernel process start time. Ambiguous matches are rejected, and a quota notice must still be present immediately before submission. This fallback tracks the process, not a Codex conversation UUID; switching conversations inside the same process is not independently identifiable. macOS still requires Herdr session metadata.
+
 ## Known gaps
 
 - The approval/question-dialog detector (`is_approval_dialog`) and the confirmation poll are heuristics written from the diagnosis, not verified against a live Codex TUI screen. They may need adjustment after a real quota-reset cycle.
